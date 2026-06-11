@@ -491,7 +491,16 @@ async function dealAndStartRound(isNewGame=false){
 function renderBidding(){
   const G=localState;
   const cp=G.bidOrder?.[G.bidStep];
-  const isme=(cp===mySlot);
+  if(cp===-1||cp===undefined){ // trick being resolved
+    gotoScreen('play-screen');
+    $('turn-indicator').textContent='Resolving trick...';
+    $('turn-indicator').style.background='#f0f0f0';
+    $('turn-indicator').style.color='#666';
+    $('play-btn').style.display='none';
+    $('shout-btn').style.display='none';
+    $('reveal-btn').style.display='none';
+  }
+  const isme=(cp===mySlot)&&(cp>=0);
   // Update status chips everywhere
   const bsr=$('bid-status-row'); bsr.innerHTML='';
   const bwb=$('bw-bids'); bwb.innerHTML='';
@@ -722,23 +731,44 @@ function renderPlaying(){
   if(isAI(cp)) maybeAIPlay();
 }
 
+// Guard: prevent AI from playing multiple times for the same state
+let aiPlayingFor=-1; // tracks which 'played' count AI is acting on
+
+let playSubmitting=false; // prevent double-submit
+
 window.submitPlay=async function(){
   if(selCard===null||selCard===undefined) return;
+  if(playSubmitting) return; // prevent rapid re-taps
+  playSubmitting=true;
+  $('play-btn').style.display='none'; // immediately hide button
+  $('shout-btn').style.display='none';
+
   const G=localState;
   const cp=G.current;
-  if(cp!==mySlot) return;
+  if(cp!==mySlot){ playSubmitting=false; return; }
+
   const card={...G.hands[cp][selCard],played:true};
-  const played=G.played+1;
-  const trickCards={...G.trickCards,[cp]:card};
-  // Update hand
+  const played=(G.played||0)+1;
+  const trickCards={...(G.trickCards||{}),[cp]:card};
+
+  // Write card to Firebase
   await update(ref(db,`rooms/${roomCode}/hands/${cp}/${selCard}`),{played:true});
-  await update(roomRef,{[`trickCards/${cp}`]:card, played});
   selCard=null;
+
   if(played<4){
     const next=(cp+1)%4;
-    await update(roomRef,{current:next});
+    await update(roomRef,{[`trickCards/${cp}`]:card, played, current:next});
+    playSubmitting=false;
   } else {
-    await resolveTrick({...G,trickCards,played});
+    // Write final card + mark as resolving so only host resolves
+    await update(roomRef,{[`trickCards/${cp}`]:card, played, current:-1, resolving:true});
+    playSubmitting=false;
+    // Host resolves — reads fresh state from Firebase to ensure all 4 cards are there
+    if(isHost){
+      const freshSnap=await get(roomRef);
+      const freshG=freshSnap.val();
+      await resolveTrick(freshG);
+    }
   }
 };
 
@@ -903,6 +933,8 @@ function checkEarlyEnd(G){
 
 // ── TRICK RESULT ──
 function renderTrickResult(){
+  playSubmitting=false; // reset for next trick
+  aiPlayingFor=-1;
   const G=localState;
   $('tr-h').textContent=pname(G.trickWinner)+' wins the trick!';
   $('tr-p').textContent=G.trickMsg||'';
@@ -1075,7 +1107,12 @@ function maybeAIPlay(){
   const G=localState;
   if(G.status!=='playing') return;
   const cp=G.current;
+  if(cp<0||cp===undefined) return; // -1 means resolving
   if(!isAI(cp)) return;
+  // Guard: don't double-trigger for same game state
+  const stateKey=(G.trickNum||0)+'-'+(G.played||0)+'-'+cp;
+  if(aiPlayingFor===stateKey) return;
+  aiPlayingFor=stateKey;
   setTimeout(async()=>{
     const hand=G.hands?.[cp]||[];
     const leader=G.leader||0;
@@ -1136,9 +1173,14 @@ function maybeAIPlay(){
     const played=(G.played||0)+1;
     const trickCards={...(G.trickCards||{}),[cp]:card};
     await update(ref(db,`rooms/${roomCode}/hands/${cp}/${pick.idx}`),{played:true});
-    await update(roomRef,{[`trickCards/${cp}`]:card,played,current:(cp+1)%4});
-    if(played>=4) await resolveTrick({...G,trickCards,played,current:cp});
-    else maybeAIPlay();
+    if(played<4){
+      await update(roomRef,{[`trickCards/${cp}`]:card, played, current:(cp+1)%4});
+      maybeAIPlay();
+    } else {
+      await update(roomRef,{[`trickCards/${cp}`]:card, played, current:-1, resolving:true});
+      const freshSnap=await get(roomRef);
+      await resolveTrick(freshSnap.val());
+    }
   },700+Math.random()*500);
 }
 
