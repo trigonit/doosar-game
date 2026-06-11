@@ -491,6 +491,7 @@ async function dealAndStartRound(isNewGame=false){
 function renderBidding(){
   const G=localState;
   const cp=G.bidOrder?.[G.bidStep];
+  if(cp!==mySlot) selCard=null; // clear selection if it moved to another player
   if(cp===-1||cp===undefined){ // trick being resolved
     gotoScreen('play-screen');
     $('turn-indicator').textContent='Resolving trick...';
@@ -704,17 +705,25 @@ function renderPlaying(){
     if(isme&&leadSuit&&G.played>0&&mySlot!==leader&&hasLed&&c.s!==leadSuit) can=false;
     el.className=`card ${isRed?'red':'black'}${can?' clickable':'  disabled'}${selCard===i?' selected':''}`;
     el.innerHTML=`<span class="r">${c.r}</span><span class="s">${c.s}</span><span class="rb">${c.r}</span>`;
-    if(can) el.onclick=()=>{selCard=(selCard===i)?null:i; shoutUsed=false; renderPlaying();};
+    if(can) el.onclick=()=>{
+      if(uiLocked||(G.played||0)>=4||G.resolving) return;
+      selCard=(selCard===i)?null:i; shoutUsed=false; renderPlaying();
+    };
     hc.appendChild(el);
   }
   $('hand-cnt').textContent=unplayed+' cards left';
 
-  // Buttons
+  // Buttons — never show if UI locked, trick resolving, or trick complete (played>=4)
   const playBtn=$('play-btn'), shoutBtn=$('shout-btn'), revealBtn=$('reveal-btn');
-  playBtn.style.display=(isme&&selCard!==null&&selCard!==undefined)?'inline-block':'none';
-  shoutBtn.style.display=(isme&&selCard!==null&&selCard!==undefined&&!shoutUsed)?'inline-block':'none';
+  const trickDone=(G.played||0)>=4||G.resolving||uiLocked;
+  const canAct=isme&&!trickDone;
+  playBtn.style.display=(canAct&&selCard!==null&&selCard!==undefined)?'inline-block':'none';
+  shoutBtn.style.display=(canAct&&selCard!==null&&selCard!==undefined&&!shoutUsed)?'inline-block':'none';
   const cpTeam=teamOf(mySlot), chooserTeam=teamOf(G.chooser);
-  const canReveal=!G.trumpRevealed&&leadSuit&&G.played>0&&mySlot!==leader&&!hasLed&&isme&&cpTeam!==chooserTeam;
+  // Reveal: only if trick is NOT complete and player hasn't played yet this trick
+  const myCardPlayed=G.trickCards?.[mySlot]!=null;
+  const canReveal=canAct&&!G.trumpRevealed&&leadSuit&&G.played>0&&mySlot!==leader
+    &&!hasLed&&cpTeam!==chooserTeam&&!myCardPlayed;
   revealBtn.style.display=canReveal?'inline-block':'none';
 
   // Message
@@ -735,13 +744,16 @@ function renderPlaying(){
 let aiPlayingFor=-1; // tracks which 'played' count AI is acting on
 
 let playSubmitting=false; // prevent double-submit
+let uiLocked=false; // locks entire play UI immediately after action
 
 window.submitPlay=async function(){
   if(selCard===null||selCard===undefined) return;
-  if(playSubmitting) return; // prevent rapid re-taps
+  if(playSubmitting||uiLocked) return;
   playSubmitting=true;
-  $('play-btn').style.display='none'; // immediately hide button
+  uiLocked=true; // lock entire UI immediately
+  $('play-btn').style.display='none';
   $('shout-btn').style.display='none';
+  $('reveal-btn').style.display='none';
 
   const G=localState;
   const cp=G.current;
@@ -782,7 +794,9 @@ window.submitShout=function(){
 
 window.submitReveal=async function(){
   const G=localState;
-  if(G.trumpRevealed) return;
+  if(G.trumpRevealed||uiLocked) return;
+  uiLocked=true;
+  $('reveal-btn').style.display='none';
   // Reveal the trump card
   const chooser=G.chooser;
   const cardIdx=G.highBid?.cardIdx;
@@ -933,7 +947,8 @@ function checkEarlyEnd(G){
 
 // ── TRICK RESULT ──
 function renderTrickResult(){
-  playSubmitting=false; // reset for next trick
+  playSubmitting=false;
+  uiLocked=false;
   aiPlayingFor=-1;
   const G=localState;
   $('tr-h').textContent=pname(G.trickWinner)+' wins the trick!';
