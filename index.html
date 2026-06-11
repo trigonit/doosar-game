@@ -33,8 +33,16 @@ h2{font-size:18px;font-weight:600;margin-bottom:8px;}
 .player-slot{display:flex;align-items:center;gap:10px;padding:10px;border-radius:8px;border:1.5px solid #e5e5e5;background:#fff;margin-bottom:6px;}
 .player-slot.filled{border-color:#185FA5;background:#EFF6FF;}
 .player-slot.me{border-color:#059669;background:#ECFDF5;}
+.player-slot.offline{border-color:#e5e5e5;background:#fafafa;opacity:0.7;}
 .player-slot .ps-name{flex:1;font-weight:500;font-size:13px;}
 .player-slot .ps-badge{font-size:11px;}
+.presence-dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:4px;flex-shrink:0;}
+.presence-dot.online{background:#22c55e;}
+.presence-dot.offline{background:#9ca3af;}
+.presence-dot.away{background:#f59e0b;}
+/* In-game presence bar */
+.presence-bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;padding:7px 10px;background:#fff;border-radius:8px;border:1px solid #e5e5e5;}
+.presence-item{display:flex;align-items:center;gap:4px;font-size:12px;color:#555;}
 .room-code{font-size:36px;font-weight:700;letter-spacing:8px;text-align:center;padding:16px;background:#fff;border-radius:12px;border:1.5px solid #e5e5e5;margin:12px 0;color:#185FA5;}
 .copy-hint{font-size:12px;color:#888;text-align:center;margin-bottom:14px;}
 
@@ -155,6 +163,12 @@ h2{font-size:18px;font-weight:600;margin-bottom:8px;}
   <input id="join-code-input" class="card-input" placeholder="ROOM CODE" maxlength="4">
   <button class="btn-secondary btn-sm" style="width:100%;margin-bottom:0;" onclick="joinRoom()">Join Room</button>
   <div id="home-err" style="color:#c0392b;font-size:13px;margin-top:8px;"></div>
+  <div id="rejoin-section" style="display:none;margin-top:16px;padding-top:16px;border-top:1px solid #e5e5e5;">
+    <p style="font-size:13px;color:#666;margin-bottom:8px;">You have an active session:</p>
+    <div id="rejoin-info" style="background:#EFF6FF;border-radius:8px;padding:10px;font-size:13px;margin-bottom:10px;color:#185FA5;"></div>
+    <button class="btn-primary btn-sm" style="width:100%;margin-bottom:6px;" onclick="rejoinGame()">↩ Rejoin Game</button>
+    <button class="btn-secondary btn-sm" style="width:100%;margin-bottom:0;" onclick="clearSession()">Clear &amp; Start Fresh</button>
+  </div>
 </div>
 
 <!-- LOBBY -->
@@ -208,6 +222,7 @@ h2{font-size:18px;font-weight:600;margin-bottom:8px;}
     <div class="chip contract-chip" id="contract-chip"></div>
     <div class="chip pool-chip" id="pool-chip" style="display:none;"></div>
   </div>
+  <div class="presence-bar" id="presence-bar"></div>
   <div id="turn-indicator" class="waiting-bar"></div>
   <div id="play-msg" class="msg info" style="display:none;"></div>
   <div class="sec-label">Table</div>
@@ -348,6 +363,8 @@ window.createRoom=async function(){
   });
   listenRoom();
   watchShouts();
+  watchPresence();
+  setupPresence();
   gotoScreen('lobby-screen');
 };
 
@@ -370,6 +387,8 @@ window.joinRoom=async function(){
   await update(ref(db,'rooms/'+roomCode+'/players/'+slot),{name,ai:false,slot});
   listenRoom();
   watchShouts();
+  watchPresence();
+  setupPresence();
   gotoScreen('lobby-screen');
 };
 
@@ -401,10 +420,13 @@ function renderLobby(){
     div.className='player-slot'+(p&&!p.ai?' filled':'')+(isMe?' me':'');
     const tb=i<2?'badge-a':'badge-b';
     const tn=i<2?'A':'B';
-    div.innerHTML=`<span class="ps-name">${p?p.name:(i===0?'Waiting...':'AI')}</span>
-      <span class="badge ${tb}">Team ${tn}</span>
-      ${isMe?'<span style="font-size:11px;color:#059669;">● You</span>':''}
-      ${p?.ai?'<span style="font-size:11px;color:#888;">🤖</span>':''}`;
+    const presence=localState.presence||{};
+    const isOnline=p?.ai?true:(presence[i]?.online===true);
+    div.innerHTML=`<span class="presence-dot ${isOnline?'online':'offline'}"></span>`
+      +`<span class="ps-name">${p?p.name:(i===0?'Waiting...':'AI')}</span>`
+      +`<span class="badge ${tb}">Team ${tn}</span>`
+      +`${isMe?'<span style="font-size:11px;color:#059669;">You</span>':''}`
+      +`${p?.ai?'<span style="font-size:11px;color:#888;">🤖</span>':''}`;
     cont.appendChild(div);
   }
   const humans=Object.values(localState.players||{}).filter(p=>!p.ai).length;
@@ -417,8 +439,10 @@ window.hostStartGame=async function(){
 };
 
 window.leaveRoom=function(){
+  teardownPresence();
   listenedRefs.forEach(r=>r.off());listenedRefs=[];listeners=[];
   roomRef=null;localState={};mySlot=-1;selCard=null;
+  window._lastPresence={};
   gotoScreen('home-screen');
 };
 
@@ -1129,6 +1153,195 @@ function watchShouts(){
   });
 }
 
+// ── PRESENCE SYSTEM ──
+let presenceRef=null;
+
+function setupPresence(){
+  if(!roomCode||mySlot<0) return;
+  const connRef = ref(db,'.info/connected');
+  const myPresenceRef = ref(db,'rooms/'+roomCode+'/presence/'+mySlot);
+  presenceRef = myPresenceRef;
+
+  connRef.on('value', snap=>{
+    if(!snap.val()) return;
+    // When connected: set online, schedule offline on disconnect
+    myPresenceRef.onDisconnect().set({
+      online: false,
+      lastSeen: firebase.database.ServerValue.TIMESTAMP,
+      name: myName
+    });
+    myPresenceRef.set({
+      online: true,
+      lastSeen: firebase.database.ServerValue.TIMESTAMP,
+      name: myName
+    });
+  });
+}
+
+function teardownPresence(){
+  if(presenceRef){
+    presenceRef.onDisconnect().cancel();
+    presenceRef.set({online:false, lastSeen: firebase.database.ServerValue.TIMESTAMP, name:myName});
+    presenceRef=null;
+  }
+}
+
+function renderPresenceBar(presence){
+  const bar=$('presence-bar');
+  if(!bar) return;
+  bar.innerHTML='';
+  for(let i=0;i<4;i++){
+    const p=presence?.[i];
+    const isAI_p=localState.players?.[i]?.ai;
+    const item=document.createElement('div');
+    item.className='presence-item';
+    const online=isAI_p?true:(p?.online===true);
+    const isMe=(i===mySlot);
+    const dot=`<span class="presence-dot ${online?'online':'offline'}"></span>`;
+    const name=pname(i)+(isMe?' (You)':'')+(isAI_p?' 🤖':'');
+    const status=isAI_p?'':(online?'':' — offline');
+    item.innerHTML=`${dot}<span>${name}${status}</span>`;
+    bar.appendChild(item);
+  }
+}
+
+// Watch presence changes and update UI
+function watchPresence(){
+  const presRef=ref(db,'rooms/'+roomCode+'/presence');
+  presRef.on('value', snap=>{
+    const presence=snap.val()||{};
+    // Update presence bar in play screen
+    renderPresenceBar(presence);
+    // Update lobby slots
+    updateLobbyPresence(presence);
+    // Toast when someone goes offline/online mid-game
+    for(let i=0;i<4;i++){
+      if(i===mySlot) continue;
+      const p=presence[i];
+      if(!p||localState.players?.[i]?.ai) continue;
+      const wasOnline=window._lastPresence?.[i]?.online;
+      const isNowOnline=p.online;
+      if(wasOnline===true&&isNowOnline===false){
+        showToast('⚠️ '+pname(i)+' went offline',3000);
+      } else if(wasOnline===false&&isNowOnline===true){
+        showToast('✅ '+pname(i)+' is back online',2500);
+      }
+    }
+    window._lastPresence=presence;
+  });
+  listenedRefs.push(presRef);
+}
+
+function updateLobbyPresence(presence){
+  const cont=$('lobby-players');
+  if(!cont) return;
+  const slots=cont.querySelectorAll('.player-slot');
+  slots.forEach((slot,i)=>{
+    const p=presence?.[i];
+    const isAI_p=localState.players?.[i]?.ai;
+    const online=isAI_p?true:(p?.online===true);
+    // Update dot if exists
+    const dot=slot.querySelector('.presence-dot');
+    if(dot) dot.className='presence-dot '+(online?'online':'offline');
+    // Toggle offline class
+    if(!isAI_p&&!online&&localState.players?.[i]&&!localState.players[i].ai){
+      slot.classList.add('offline');
+    } else {
+      slot.classList.remove('offline');
+    }
+  });
+}
+
+// ── SESSION PERSISTENCE ──
+function saveSession(){
+  localStorage.setItem('doosar_session', JSON.stringify({
+    roomCode, mySlot, myName, isHost, ts: Date.now()
+  }));
+}
+
+function clearSession(){
+  localStorage.removeItem('doosar_session');
+  $('rejoin-section').style.display='none';
+  $('home-err').textContent='';
+}
+
+function checkSavedSession(){
+  const raw=localStorage.getItem('doosar_session');
+  if(!raw) return;
+  let sess;
+  try{ sess=JSON.parse(raw); }catch(e){ return; }
+  // Only offer rejoin if session is less than 2 hours old
+  if(Date.now()-sess.ts > 2*60*60*1000){ clearSession(); return; }
+  $('rejoin-info').textContent=`Room: ${sess.roomCode} · Seat: Player ${sess.mySlot+1} · Name: ${sess.myName}`;
+  $('rejoin-section').style.display='block';
+  // Pre-fill name field
+  $('player-name-input').value=sess.myName;
+}
+
+window.rejoinGame=async function(){
+  const raw=localStorage.getItem('doosar_session');
+  if(!raw) return;
+  const sess=JSON.parse(raw);
+  roomCode=sess.roomCode;
+  mySlot=sess.mySlot;
+  myName=sess.myName;
+  isHost=sess.isHost||false;
+  roomRef=ref(db,'rooms/'+roomCode);
+  const snap=await get(roomRef);
+  if(!snap.exists()){
+    showToast('Room no longer exists.',2500);
+    clearSession();
+    return;
+  }
+  const room=snap.val();
+  // Verify slot still belongs to this player (not taken over by someone else)
+  const slotPlayer=room.players?.[mySlot];
+  if(!slotPlayer||slotPlayer.name!==myName){
+    showToast('Your slot was reassigned. Please join fresh.',3000);
+    clearSession();
+    return;
+  }
+  showToast('Rejoined successfully!',2000);
+  listenRoom();
+  watchShouts();
+  watchPresence();
+  setupPresence();
+  // Navigate to right screen based on game status
+  if(room.status==='lobby') gotoScreen('lobby-screen');
+  else gotoScreen('play-screen'); // listenRoom will correct this
+};
+
+// Patch saveSession into all key actions
+const _origCreateRoom=window.createRoom;
+window.createRoom=async function(){
+  await _origCreateRoom();
+  saveSession();
+};
+const _origJoinRoom=window.joinRoom;
+window.joinRoom=async function(){
+  await _origJoinRoom();
+  saveSession();
+};
+const _origSubmitPlay=window.submitPlay;
+window.submitPlay=async function(){
+  await _origSubmitPlay();
+  saveSession();
+};
+const _origSubmitBid=window.submitBid;
+window.submitBid=async function(){
+  await _origSubmitBid();
+  saveSession();
+};
+
+// Also save on visibility change (tab switch / backgrounding)
+document.addEventListener('visibilitychange',()=>{
+  if(roomCode) saveSession();
+});
+// Save on beforeunload
+window.addEventListener('beforeunload',()=>{
+  if(roomCode) saveSession();
+});
+
 // Watch shouts - called after joining room
 function watchShouts(){
   const shoutRef=ref(db,'rooms/'+roomCode+'/lastShout');
@@ -1141,6 +1354,8 @@ function watchShouts(){
   listenedRefs.push(shoutRef);
 }
 
+// Check for saved session on load
+checkSavedSession();
 </script>
 </body>
 </html>
